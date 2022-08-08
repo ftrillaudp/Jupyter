@@ -1,0 +1,12 @@
+jupyter notebook &
+
+jupyter notebook notebook.ipynb
+
+jupyter notebook --no-browser
+
+execute notebook
+jupyter run notebook.ipynb
+
+
+
+
