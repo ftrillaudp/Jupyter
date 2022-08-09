@@ -1,0 +1,306 @@
+FUNCTION getDissipation(Model, n, arg) RESULT(G)
+  !!! Frederic Trillaud <ftrillaudp@gmail.com> - July 4, 2020
+  !!! elmerf90 -o dissipation.so dissipation.F90
+  !!! Create the local heat disturbance Q(t,x) and computes the heat generation G, sum up both parties to get the local total heat dissipation in W/kg: G+Q
+
+  ! Elmer module
+  USE DefUtils
+
+  IMPLICIT NONE
+  TYPE(Model_t) :: model
+  INTEGER :: n
+  REAL(KIND=dp) :: arg(*)
+  REAL(KIND=dp) :: T, Bx, By, Bz, B, Jex, Jey, Jez, mu0
+  REAL(KIND=dp) :: Tcm0, G, Tcs, lambda, f, beta, Top
+  REAL(KIND=dp) :: sigma_m, gamma_m, sigma_sc, gamma_sc, Je, Jm, Jc, Jc_op, nv_ref, nValue, Ec, Jsc
+  REAL(KIND=dp) :: tt, Qg
+  LOGICAL :: gotIt, visu
+
+  !!! Get parameters from sif file:
+  ! variables needed inside function
+  TYPE(ValueList_t), POINTER :: material, const
+  ! get pointer on list for material
+  material => GetMaterial()
+  IF (.NOT. ASSOCIATED(material)) THEN
+    CALL Fatal('getDissipation', 'No material found')
+  END IF
+  ! read in reference n-value
+  nv_ref = GetConstReal( material, 'N-Value', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'N-Value')
+  END IF
+  ! read in reference critical Temperature
+  Tcm0 = GetConstReal( material, 'Critical Temperature', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Critical Temperature')
+  END IF
+  ! read in the electrical conductivity
+  sigma_m = GetConstReal( material, 'Matrix Electric Conductivity', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Matrix Electric Conductivity')
+  END IF
+  ! read in the densities
+  gamma_m = GetConstReal( material, 'Matrix Density', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Matrix Density')
+  END IF
+  gamma_sc = GetConstReal( material, 'Superconductor Density', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Superconductor Density')
+  END IF
+  lambda = GetConstReal( material, 'Matrix to Superconductor Ratio', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Matrix to Superconductor Ratio')
+  END IF
+  f = GetConstReal( material, 'Filling Factor', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Filling Factor')
+  END IF
+  Ec = GetConstReal( material, 'Critical Electrical Field', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Critical Electrical Field')
+  END IF
+  Top = GetConstReal( material, 'Operating Temperature', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Operating Temperature')
+  END IF
+
+  const => GetConstants()
+  IF (.NOT. ASSOCIATED(const)) THEN
+    CALL Fatal('getDissipation', 'No constant found')
+  END IF
+  mu0 = GetConstReal( const, 'Permeability of Vacuum', gotIt)
+  IF (.NOT. gotIt) THEN
+    CALL Fatal('getDissipation', 'Permeability of Vacuum')
+  END IF
+
+  visu = .FALSE.
+
+  !!! Get the variables from the input:
+  tt = arg(1)
+  T = ABS(arg(2))
+  Bx = arg(3)
+  By = arg(4)
+  Bz = arg(5)
+  Jex = arg(6)
+  Jey = arg(7)
+  Jez = arg(8)
+
+  B = SQRT(Bx**2+By**2+Bz**2)
+  Je = SQRT(Jex**2+Jey**2+Jez**2)
+
+  ! Patch on the temperature to limit the appearance of negative temperature or temperature below the minimum temperature
+  IF (T < Top) THEN
+    T = Top
+  ELSE IF (T > 299.0) THEN
+    T = 299.0 ! No material property data above 300 K
+  END IF
+
+  Jc_op = getJc(Top,B)
+  !!! Current-sharing temperature (K):
+  Tcs = Tcm0 + f*(1.0+lambda)*(Je/Jc_op)*(Top-Tcm0)
+
+  ! basic model assuming steep transition
+  !IF (T < (0.5*(Tcs+Tcm0))) THEN
+  !  PRINT *, "*** NO DISSIPATION ***"
+  !  G = 0.0
+  !ELSE
+  !  PRINT *, "*** FULL DISSIPATION ***"
+  !  G = ((f*(1.0+1.0/lambda)*Je)**2)/(sigma_m*gamma_m)
+  !END IF
+
+  !!! Heat dissipation G (W/kg):
+  ! Superconducting state
+  IF (T < Tcs) THEN
+    IF (visu) THEN
+      PRINT *, "*** NO DISSIPATION ***"
+    END IF
+    G = 0.0
+  ! Current-sharing model
+  ELSE IF (( T >= Tcs) .AND. (T < Tcm0 )) THEN
+    IF (visu) THEN
+      PRINT *, "*** MIXED DISSIPATION ***"
+    END IF
+    Jc = getJc(T,B)
+    nValue = getNvalue(T,B,nv_ref)
+    CALL NRSolver_Jsc(Jsc,Je,Jc,nValue,lambda,f,sigma_m,Ec)
+    Jm = f*(1.0+1.0/lambda)*Je-(f/lambda)*Jsc
+    sigma_sc = ((Jc**nValue)/Ec)*(Jsc**(1-nValue))
+    IF (visu) THEN
+      PRINT 1, Jc,nValue,Jm,sigma_sc
+      1  FORMAT(' Jc: ', EN12.3, ' n-Value: ', EN12.3, ' Jm: ', EN12.3, ' sigma_sc: ', EN12.3)
+    END IF
+    G = (Jm**2)/(sigma_m*gamma_m)+(Jsc**2)/(sigma_sc*gamma_sc)
+  ! Normal resistive state
+  ELSE
+    IF (visu) THEN
+      PRINT *, "*** FULL DISSIPATION ***"
+    END IF
+    G = ((f*(1.0+1.0/lambda)*Je)**2)/(sigma_m*gamma_m)
+  END IF
+  ! Adding the disturbance to the dissipation
+  G = G + getQd(model, n, tt)
+
+  IF (visu) THEN
+    PRINT 2, Jc_op, B, Top
+    2  FORMAT(' Jc_op(Top,B): ', EN12.3,', B: ', EN12.3, ', Top: ', EN12.3)
+    PRINT 3, T, Tcs
+    3  FORMAT(' T: ', EN12.3,', Tcs = ', EN12.3)
+    PRINT 4, G
+    4  FORMAT(' G: ', EN12.3)
+  END IF
+
+  CONTAINS
+    !!! Compute Jc(T,B,eps) in A/m^2:
+    FUNCTION getJc(arg_T,arg_B) RESULT(JJc)
+      IMPLICIT NONE
+      REAL(KIND=dp) :: arg_T, arg_B, JJc, epsB
+      REAL(KIND=dp) :: Ca1, Ca2, e_0a, e_m, e_ap, e_a, e_sh, s
+      REAL(KIND=dp) :: Tc0e, tt, Bc2m0, Bc2, bb, MDG, C1, p, q
+
+      epsB = 0.001 ! to avoid division by zero in JJc
+      ! RP Nb3Sn: A. Godeke, "Characterization of High Current RRP Wires as a Function of Magnetic Field, Temperature, and Strain", IEEE-TAS, 2009
+      Ca1 = 47.6
+      Ca2 = 6.4
+      e_0a = 0.273/100
+      e_m = -0.09/100
+      e_ap = 0.0
+      e_a = e_ap+e_m
+      e_sh = Ca2*e_0a/SQRT(Ca1**2-Ca2**2)
+      s = (1/(1-Ca1*e_0a))*(Ca1*(SQRT(e_sh**2+e_0a**2)-SQRT((e_a-e_sh)**2+e_0a**2))-Ca2*e_a)+1
+
+      Tc0e = Tcm0*s**(1/3)
+      tt = arg_T/Tc0e
+
+      Bc2m0 = 30.7
+      MDG = 1-tt**1.52
+      Bc2 = Bc2m0*MDG*s
+      bb = arg_B/Bc2
+
+      C1 = 30.0e8
+      p = 0.5
+      q = 2
+
+      IF (arg_T < Tcm0) THEN
+        IF (arg_B == 0) THEN
+          bb = (arg_B+epsB)/Bc2
+          JJc = (C1/(arg_B+epsB))*s*(1-tt**1.52)*(1-tt**2)*(bb**p)*((1-bb)**q)
+        ELSE
+          JJc = (C1/arg_B)*s*(1-tt**1.52)*(1-tt**2)*(bb**p)*((1-bb)**q)
+        END IF
+      ELSE
+        JJc = 0.0
+      END IF
+    END FUNCTION getJc
+
+    !!! N-value, n(T,B):
+    FUNCTION getNValue(arg_T,arg_B,nv_ref) RESULT(nValue)
+      IMPLICIT NONE
+      REAL(KIND=dp) :: arg_T, arg_B, nValue, nv_ref
+      nValue = nv_ref
+    END FUNCTION getNValue
+
+    !!! Newton-Raphson algorithm, solve Jsc
+    SUBROUTINE NRSolver_Jsc(Jsc,Je,Jc,nValue,lambda,f,sigma_m,Ec)
+      IMPLICIT NONE
+      REAL(kind=dp), INTENT(IN) :: Je, Jc, nValue, lambda, f, sigma_m, Ec
+      REAL(kind=dp), INTENT(OUT) :: Jsc
+      REAL(kind=dp) :: fx, dfx, beta
+      REAL(kind=dp) :: tol_rel, er_rel
+      INTEGER :: k, max_iter
+
+      beta = f*(Jc**nValue)/(sigma_m*lambda*Ec)
+      IF (visu) THEN
+        PRINT 5, beta
+        5  FORMAT(' Beta: ', EN12.3)
+      END IF
+
+      k = 1
+      max_iter = 2000
+      tol_rel = 0.001
+      er_rel = 1000.0
+      Jsc = Je
+      ! Newton loop
+      DO WHILE ((er_rel > tol_rel) .AND. (k < max_iter))
+        fx = (Jsc**nValue)+beta*Jsc-(1.0+lambda)*beta*Je
+        dfx = nValue*(Jsc**(nValue-1))+beta
+        Jsc = Jsc - fx/dfx
+        IF (dfx == 0.0) THEN
+          PRINT *, "*** WARNING: Derivative equal to zero, aborting Newton-Raphson algorithm ***"
+          EXIT
+        END IF
+        er_rel = ABS(fx/(Jsc*dfx))
+        IF (visu) THEN
+          PRINT 6, fx,dfx,er_rel
+          6  FORMAT(' fx: ', EN12.3, ', dfx: ', EN12.3, ', er. rel.: ', EN12.3)
+          PRINT 7, k,Jsc
+          7  FORMAT(' Newton-Raphson - iteration: ', I5, ', Jsc = ', EN12.3)
+        END IF
+        k = k+1
+      END DO
+    END SUBROUTINE NRSolver_Jsc
+
+    !!! Local heat disturbance in W/kg, Q:
+    FUNCTION getQd(model, n, tt) RESULT(Qg)
+      IMPLICIT NONE
+      TYPE(Model_t) :: model
+      INTEGER :: n
+      REAL(KIND=dp) :: tt
+      REAL(KIND=dp) :: X, Y, Z, t_ini_d, Dt_d, Qd, Qg
+      REAL(KIND=dp) :: R_dist, x_d, y_d, z_d, d
+
+      ! Parameters needed inside the function
+      TYPE(ValueList_t), POINTER :: bfList
+      bfList => getbodyforce()
+      ! Value of the dissipation in the disturbance (W/kg)
+      Qd = ListGetConstReal(bfList, 'Disturbance Specific Power', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Specific Power not found')
+      END IF
+      ! Initial time of the disturbance
+      t_ini_d = ListGetConstReal(bfList, 'Disturbance Initial Time', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Initial Time not found')
+      END IF
+      ! Time duration of the disturbance
+      Dt_d = ListGetConstReal(bfList, 'Disturbance Duration', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Duration not found')
+      END IF
+      ! Position of the center of the disturbance
+      x_d = ListGetConstReal(bfList, 'Disturbance X Center', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance X Center not found')
+      END IF
+      y_d = ListGetConstReal(bfList, 'Disturbance Y Center', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Y Center not found')
+      END IF
+      z_d = ListGetConstReal(bfList, 'Disturbance Z Center', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Z Center not found')
+      END IF
+      ! Dimension of the spherical disturbance
+      ! of the order of the length of geometry over number of elements
+      R_dist = ListGetConstReal(bfList, 'Disturbance Size', gotIt)
+      IF ( .NOT. gotIt ) THEN
+        CALL Warn('getDisturbance', 'Disturbance Size not found')
+      END IF
+
+      ! get local coordinates of the nodes
+      X = model % Nodes % x(n)
+      Y = model % Nodes % y(n)
+      Z = model % Nodes % z(n)
+
+      ! distance to center of disturbance
+      d = SQRT((X-x_d)**2+(Y-y_d)**2+(Z-z_d)**2)
+
+      !!! Need to check if the mesh is fine enough otherwise the temperature is psuriously diffused over the mesh!
+
+      Qg = 0.0D00
+      IF ((d <= R_dist) .AND. (tt > t_ini_d) .AND. (tt < (t_ini_d+Dt_d))) THEN
+        Qg = Qd
+      END IF
+    END FUNCTION getQd
+
+END FUNCTION getDissipation
